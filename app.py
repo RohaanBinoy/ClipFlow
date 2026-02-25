@@ -95,6 +95,74 @@ class CLIP4ClipModel(BaseAIModel):
         text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         return text_features[0].tolist()
 
+class ClipperCustomModel(BaseAIModel):
+    """Your proprietary local model using the Clipper architecture."""
+    def __init__(self):
+        import torch
+        # Import your local custom Python files!
+        try:
+            from config import ClipperConfig
+            from model import ClipperModel
+        except ImportError:
+            st.error("Missing config.py or model.py! Please put them in the same folder as app.py.")
+            st.stop()
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.weights_path = "clipper_best.pt" # Ensure this file is in your folder!
+        
+        # Load your custom architecture
+        self.config = ClipperConfig()
+        self.config.use_custom_modules = True
+        self.model = ClipperModel(self.config).eval().to(self.device)
+        
+        # Load your custom weights
+        if os.path.exists(self.weights_path):
+            ckpt = torch.load(self.weights_path, map_location=self.device)
+            self.model.load_state_dict(ckpt, strict=False)
+        else:
+            st.warning(f"Weights not found at {self.weights_path}. Running zero-shot mode.")
+
+    def get_video_embedding(self, video_path):
+        import cv2
+        from PIL import Image
+        import torch
+        
+        # We use your exact custom frame sampling logic via OpenCV
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        idxs = np.linspace(0, max(0, total_f - 1), self.config.num_frames, dtype=int)
+        frames = []
+        for idx in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, fr = cap.read()
+            if ok:
+                frames.append(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+        cap.release()
+        
+        while len(frames) < self.config.num_frames:
+            frames.append(frames[-1] if frames else np.zeros((224, 224, 3), dtype=np.uint8))
+        frames = frames[:self.config.num_frames]
+        
+        imgs = [self.model.preprocess(Image.fromarray(f)) for f in frames]
+        x = torch.stack(imgs).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            # Get your custom embeddings
+            clip_e, frame_e = self.model.encode_video(x)
+            
+        # We return the primary global clip embedding for ChromaDB
+        return clip_e.squeeze().tolist()
+
+    def get_text_embedding(self, text):
+        import torch
+        with torch.no_grad():
+            tokens = self.model.tokenizer([text]).to(self.device)
+            t_emb, c_emb = self.model.encode_text(tokens)
+            
+        # Return the primary text embedding
+        return t_emb.squeeze().tolist()
     
 # --- 2. THE DATABASE SETUP ---
 client = chromadb.Client()
@@ -129,10 +197,22 @@ st.write("Upload a video, and we will chop it up, embed it, and make it searchab
 st.sidebar.header("⚙️ Settings")
 selected_model = st.sidebar.selectbox(
     "Choose AI Engine", 
-    ["Original CLIP (Baseline)", "Searchium CLIP4Clip (High Accuracy)", "Dummy Model (Fast Testing)"]
+    [
+        "Original CLIP (Baseline)", 
+        "Searchium CLIP4Clip (High Accuracy)", 
+        "Clipper (Custom Local Model)",  # <-- Added your new model here!
+        "Dummy Model (Fast Testing)"
+    ]
 )
 
+
+# Add a slider so you can control how strict the AI is
+confidence_threshold = st.sidebar.slider("Minimum Confidence Score (%)", min_value=0.0, max_value=100.0, value=20.0, step=0.5)
 # Cache both models separately so switching is instant after the first load
+@st.cache_resource
+def load_clipper():
+    return ClipperCustomModel()
+    
 @st.cache_resource
 def load_baseline():
     return RealCLIPModel()
@@ -146,9 +226,11 @@ if selected_model == "Original CLIP (Baseline)":
     model = load_baseline()
 elif selected_model == "Searchium CLIP4Clip (High Accuracy)":
     model = load_clip4clip()
+elif selected_model == "Clipper (Custom Local Model)":
+    model = load_clipper()
 else:
     model = DummyModel()
-    
+
 uploaded_file = st.file_uploader("Upload a Video (mp4)", type=["mp4"])
 
 if uploaded_file is not None:
@@ -208,13 +290,22 @@ if uploaded_file is not None:
                         docs = results['documents'][0]
                         distances = results['distances'][0]
                         
-                        # Loop through all 5 results and display them
+    
+                        # Loop through all 5 results and filter them
+                        matches_displayed = 0
                         for i, (doc, dist) in enumerate(zip(docs, distances)):
-                            # Convert Chroma's raw distance metric to a clean 0-100% similarity score
+                            # Convert distance to percentage
                             similarity_score = (1 - (dist / 2)) * 100
                             
-                            st.write(f"**Match #{i+1}** | AI Confidence Score: `{similarity_score:.2f}%`")
-                            st.video(doc)
-                            st.divider() # Adds a clean visual line between videos
+                            # THE FILTER: Only show it if it beats our slider threshold
+                            if similarity_score >= confidence_threshold:
+                                st.write(f"**Match #{matches_displayed+1}** | AI Confidence Score: `{similarity_score:.2f}%`")
+                                st.video(doc)
+                                st.divider()
+                                matches_displayed += 1
+                        
+                        # Tell the user if nothing passed the test
+                        if matches_displayed == 0:
+                            st.warning(f"No clips found with a confidence score above {confidence_threshold}%. Try lowering the slider or changing your search prompt!")
                     else:
                         st.warning("Could not find a match.")
