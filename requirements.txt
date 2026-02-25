@@ -1,0 +1,7 @@
+streamlit
+moviepy
+numpy
+chromadb
+torch
+transformers
+pillow
